@@ -1,6 +1,6 @@
 idf_component_register(
     SRCS "ws_transport.c"
     INCLUDE_DIRS "include"
-    # esp_websocket_client is added when implementing
-    # REQUIRES esp_websocket_client log
+    REQUIRES va_common espressif__esp_websocket_client esp_wifi nvs_flash
+             esp_event esp_netif log freertos
 )

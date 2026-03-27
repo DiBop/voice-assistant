@@ -1,0 +1,21 @@
+menu "Voice Assistant Config"
+
+config VA_WIFI_SSID
+    string "WiFi SSID"
+    default "myssid"
+    help
+        WiFi network name.
+
+config VA_WIFI_PASSWORD
+    string "WiFi Password"
+    default "mypassword"
+    help
+        WiFi password.
+
+config VA_SERVER_URI
+    string "Companion server WebSocket URI"
+    default "ws://192.168.1.100:8765"
+    help
+        WebSocket URI of the local companion server.
+
+endmenu
