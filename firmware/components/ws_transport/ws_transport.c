@@ -13,8 +13,10 @@
 static const char *TAG = "ws_transport";
 
 #define WIFI_CONNECTED_BIT  BIT0
-#define WIFI_FAIL_BIT       BIT1
 #define WIFI_CONNECT_TIMEOUT_MS  15000
+
+#define WS_OPCODE_TEXT   0x1
+#define WS_OPCODE_BINARY 0x2
 
 static EventGroupHandle_t            s_wifi_events = NULL;
 static esp_websocket_client_handle_t s_ws          = NULL;
@@ -47,8 +49,16 @@ static esp_err_t wifi_connect(void) {
     }
     if (ret != ESP_OK) return ret;
 
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_err_t netif_ret = esp_netif_init();
+    if (netif_ret != ESP_OK && netif_ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "netif init failed: %s", esp_err_to_name(netif_ret));
+        return netif_ret;
+    }
+    esp_err_t loop_ret = esp_event_loop_create_default();
+    if (loop_ret != ESP_OK && loop_ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "event loop create failed: %s", esp_err_to_name(loop_ret));
+        return loop_ret;
+    }
     esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -91,12 +101,14 @@ static void ws_event_handler(void *arg, esp_event_base_t base,
             ESP_LOGW(TAG, "WebSocket disconnected");
             break;
         case WEBSOCKET_EVENT_DATA:
-            if (ev->op_code == 0x2) {  // binary — TTS audio PCM
+            if (ev->op_code == WS_OPCODE_BINARY) {  // binary — TTS audio PCM
                 if (s_audio_cb) {
                     s_audio_cb((const uint8_t *)ev->data_ptr, ev->data_len, s_cb_ctx);
                 }
-            } else if (ev->op_code == 0x1) {  // text — control message
-                if (ev->data_ptr && strstr(ev->data_ptr, "tts_done") && s_done_cb) {
+            } else if (ev->op_code == WS_OPCODE_TEXT) {  // text — control message
+                if (ev->data_ptr && ev->data_len > 0 &&
+                    memmem(ev->data_ptr, ev->data_len, "tts_done", 8) != NULL &&
+                    s_done_cb) {
                     s_done_cb(s_cb_ctx);
                 }
             }
@@ -170,7 +182,13 @@ esp_err_t ws_transport_send_control(const char *type) {
     return (sent >= 0) ? ESP_OK : ESP_FAIL;
 }
 
+// Must be called before ws_transport_connect(). Callback pointers are
+// read from the WebSocket event task — setting them after connect() is
+// a data race on dual-core ESP32-S3.
 void ws_transport_set_tts_cb(tts_audio_cb_t audio_cb, tts_done_cb_t done_cb, void *ctx) {
+    if (s_ws && esp_websocket_client_is_connected(s_ws)) {
+        ESP_LOGW(TAG, "set_tts_cb called after connect — potential race condition");
+    }
     s_audio_cb = audio_cb;
     s_done_cb  = done_cb;
     s_cb_ctx   = ctx;
