@@ -17,7 +17,6 @@ static const char *TAG = "main";
 typedef enum {
     EVT_WAKE_WORD,
     EVT_SILENCE_TIMEOUT,
-    EVT_SERVER_TIMEOUT,
     EVT_TTS_AUDIO,
     EVT_TTS_DONE,
 } va_event_type_t;
@@ -43,17 +42,25 @@ static volatile bool s_streaming = false;
 
 static void on_wake_word(void *ctx) {
     va_event_t ev = { .type = EVT_WAKE_WORD, .data = NULL, .data_len = 0 };
-    xQueueSend(s_evt_queue, &ev, 0);
+    if (xQueueSend(s_evt_queue, &ev, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "event queue full, WAKE_WORD dropped");
+    }
 }
 
 static void on_tts_audio(const uint8_t *data, int len, void *ctx) {
-    va_event_t ev = { .type = EVT_TTS_AUDIO, .data = data, .data_len = len };
-    xQueueSend(s_evt_queue, &ev, 0);
+    // Note: we don't copy the audio data — TTS playback is a future task.
+    // The event just signals that the server has started sending audio.
+    va_event_t ev = { .type = EVT_TTS_AUDIO, .data = NULL, .data_len = 0 };
+    if (xQueueSend(s_evt_queue, &ev, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "event queue full, TTS_AUDIO dropped");
+    }
 }
 
 static void on_tts_done(void *ctx) {
     va_event_t ev = { .type = EVT_TTS_DONE, .data = NULL, .data_len = 0 };
-    xQueueSend(s_evt_queue, &ev, 0);
+    if (xQueueSend(s_evt_queue, &ev, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "event queue full, TTS_DONE dropped");
+    }
 }
 
 // ── Stream task ──────────────────────────────────────────────────────────
@@ -137,13 +144,14 @@ static void state_machine_task(void *arg) {
                     state = VA_STATE_SPEAKING;
                     va_led_set_state(state);
                     deadline = portMAX_DELAY;
-                    // TTS audio playback: future task — write ev.data to I2S output
+                    // TTS audio playback: future task
                 }
                 break;
 
             case VA_STATE_SPEAKING:
                 if (ev.type == EVT_TTS_AUDIO) {
                     // Additional TTS audio chunks — future: write to I2S output
+                    (void)ev; // data pointer not stored; playback is a future task
                 }
                 if (ev.type == EVT_TTS_DONE) {
                     ESP_LOGI(TAG, "SPEAKING -> IDLE");
@@ -188,8 +196,14 @@ void app_main(void) {
     ESP_ERROR_CHECK(wake_word_start());
 
     // Start tasks
-    xTaskCreate(stream_task,        "stream",   4096, NULL, 10, NULL);
-    xTaskCreate(state_machine_task, "state_m",  4096, NULL,  5, NULL);
+    if (xTaskCreate(stream_task, "stream", 4096, NULL, 10, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create stream task");
+        return;
+    }
+    if (xTaskCreate(state_machine_task, "state_m", 6144, NULL, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create state machine task");
+        return;
+    }
 
     va_led_set_state(VA_STATE_IDLE);
     ESP_LOGI(TAG, "Ready — say 'Hi ESP'");
