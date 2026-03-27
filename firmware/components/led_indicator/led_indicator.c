@@ -5,6 +5,8 @@
 #include "driver/rmt_encoder.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
+#include <stdatomic.h>
 
 static const char *TAG = "led";
 
@@ -93,8 +95,8 @@ static esp_err_t create_ws2812_encoder(rmt_encoder_handle_t *ret)
     err = rmt_new_copy_encoder(&copy_cfg, &enc->copy_encoder);
     if (err != ESP_OK) { rmt_del_encoder(enc->bytes_encoder); free(enc); return err; }
 
-    // Reset pulse: LOW for 50 µs = 500 ticks at 10 MHz, split into two durations
-    uint32_t reset_ticks = WS2812_RMT_RESOLUTION_HZ / 1000000 * 50 / 2; // 250 ticks
+    // Reset pulse: LOW for 80 µs = 800 ticks at 10 MHz, split into two durations
+    uint32_t reset_ticks = WS2812_RMT_RESOLUTION_HZ / 1000000 * 80 / 2; // 400 ticks
     enc->reset_code = (rmt_symbol_word_t){
         .level0 = 0, .duration0 = reset_ticks,
         .level1 = 0, .duration1 = reset_ticks,
@@ -109,7 +111,8 @@ static esp_err_t create_ws2812_encoder(rmt_encoder_handle_t *ret)
 static rmt_channel_handle_t s_rmt_chan  = NULL;
 static rmt_encoder_handle_t s_encoder   = NULL;
 static TaskHandle_t         s_pulse_task = NULL;
-static volatile va_state_t  s_current_state = VA_STATE_IDLE;
+static _Atomic va_state_t   s_current_state = VA_STATE_IDLE;
+static SemaphoreHandle_t    s_lock = NULL;
 static grb_t                s_pixels[BOARD_LED_COUNT];
 
 typedef struct { uint8_t r, g, b; } rgb_t;
@@ -123,19 +126,26 @@ static const rgb_t STATE_COLORS[] = {
     [VA_STATE_ERROR]     = {255, 0,   0},
 };
 
-static bool is_pulse_state(va_state_t s) {
+static inline bool is_pulse_state(va_state_t s) {
     return s == VA_STATE_STREAMING || s == VA_STATE_WAITING;
 }
 
-static bool is_blink_state(va_state_t s) {
+static inline bool is_blink_state(va_state_t s) {
     return s == VA_STATE_ERROR;
 }
 
 static void flush_pixels(void)
 {
-    rmt_transmit_config_t tx_cfg = { .loop_count = 0 };
-    rmt_transmit(s_rmt_chan, s_encoder, s_pixels, sizeof(s_pixels), &tx_cfg);
-    rmt_tx_wait_all_done(s_rmt_chan, pdMS_TO_TICKS(100));
+    rmt_transmit_config_t tx_cfg = {0};
+    esp_err_t ret = rmt_transmit(s_rmt_chan, s_encoder, s_pixels, sizeof(s_pixels), &tx_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "rmt_transmit failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    ret = rmt_tx_wait_all_done(s_rmt_chan, pdMS_TO_TICKS(100));
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "rmt_tx_wait_all_done failed: %s", esp_err_to_name(ret));
+    }
 }
 
 static void set_all(uint8_t r, uint8_t g, uint8_t b)
@@ -150,16 +160,20 @@ static void pulse_task(void *arg)
 {
     bool bright = true;
     while (1) {
-        va_state_t st = s_current_state;
+        va_state_t st = atomic_load(&s_current_state);
         if (is_pulse_state(st)) {
             rgb_t c = STATE_COLORS[st];
             uint8_t div = bright ? 1 : 8;
+            xSemaphoreTake(s_lock, portMAX_DELAY);
             set_all(c.r / div, c.g / div, c.b / div);
+            xSemaphoreGive(s_lock);
             bright = !bright;
             vTaskDelay(pdMS_TO_TICKS(500));
         } else if (is_blink_state(st)) {
             rgb_t c = STATE_COLORS[st];
+            xSemaphoreTake(s_lock, portMAX_DELAY);
             set_all(bright ? c.r : 0, bright ? c.g : 0, bright ? c.b : 0);
+            xSemaphoreGive(s_lock);
             bright = !bright;
             vTaskDelay(pdMS_TO_TICKS(150));
         } else {
@@ -203,16 +217,36 @@ esp_err_t va_led_init(void)
     // Clear all LEDs
     set_all(0, 0, 0);
 
-    xTaskCreate(pulse_task, "led_pulse", 2048, NULL, 3, &s_pulse_task);
+    if (xTaskCreate(pulse_task, "led_pulse", 4096, NULL, 3, &s_pulse_task) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create pulse task");
+        rmt_disable(s_rmt_chan);
+        rmt_del_encoder(s_encoder);
+        rmt_del_channel(s_rmt_chan);
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_lock = xSemaphoreCreateMutex();
+    if (s_lock == NULL) {
+        ESP_LOGE(TAG, "Failed to create mutex");
+        vTaskDelete(s_pulse_task);
+        rmt_disable(s_rmt_chan);
+        rmt_del_encoder(s_encoder);
+        rmt_del_channel(s_rmt_chan);
+        return ESP_ERR_NO_MEM;
+    }
+
     ESP_LOGI(TAG, "LED indicator ready (%d LEDs on GPIO %d)", BOARD_LED_COUNT, BOARD_LED_GPIO);
     return ESP_OK;
 }
 
 void va_led_set_state(va_state_t state)
 {
-    s_current_state = state;
+    if (s_rmt_chan == NULL) return;
+    atomic_store(&s_current_state, state);
     if (!is_pulse_state(state) && !is_blink_state(state)) {
         rgb_t c = STATE_COLORS[state];
+        xSemaphoreTake(s_lock, portMAX_DELAY);
         set_all(c.r, c.g, c.b);
+        xSemaphoreGive(s_lock);
     }
 }
