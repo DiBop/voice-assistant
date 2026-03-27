@@ -12,8 +12,15 @@ static audio_pipeline_handle_t s_pipeline   = NULL;
 static audio_element_handle_t  s_i2s_reader = NULL;
 static audio_element_handle_t  s_resample   = NULL;
 static audio_element_handle_t  s_raw_read   = NULL;
+static bool                    s_running    = false;
 
 esp_err_t audio_pipeline_mgr_init(void) {
+    s_pipeline   = NULL;
+    s_i2s_reader = NULL;
+    s_resample   = NULL;
+    s_raw_read   = NULL;
+    s_running    = false;
+
     // Create pipeline
     audio_pipeline_cfg_t pipe_cfg = DEFAULT_AUDIO_PIPELINE_CONFIG();
     s_pipeline = audio_pipeline_init(&pipe_cfg);
@@ -45,10 +52,12 @@ esp_err_t audio_pipeline_mgr_init(void) {
     rsp_cfg.dest_rate = 16000;
     rsp_cfg.src_ch    = 1;
     rsp_cfg.dest_ch   = 1;
-    rsp_cfg.mode      = RESAMPLE_ENCODE_MODE;
+    rsp_cfg.mode      = RESAMPLE_ENCODE_MODE;  // capture/encode path (vs DECODE_MODE for playback)
     s_resample = rsp_filter_init(&rsp_cfg);
     if (!s_resample) {
         ESP_LOGE(TAG, "rsp_filter_init failed");
+        audio_element_deinit(s_i2s_reader);
+        s_i2s_reader = NULL;
         audio_pipeline_deinit(s_pipeline);
         s_pipeline = NULL;
         return ESP_FAIL;
@@ -60,32 +69,64 @@ esp_err_t audio_pipeline_mgr_init(void) {
     s_raw_read = raw_stream_init(&raw_cfg);
     if (!s_raw_read) {
         ESP_LOGE(TAG, "raw_stream_init failed");
+        audio_element_deinit(s_i2s_reader);
+        s_i2s_reader = NULL;
+        audio_element_deinit(s_resample);
+        s_resample = NULL;
         audio_pipeline_deinit(s_pipeline);
         s_pipeline = NULL;
         return ESP_FAIL;
     }
 
     // Register and link: i2s → resample → raw
-    audio_pipeline_register(s_pipeline, s_i2s_reader, "i2s");
-    audio_pipeline_register(s_pipeline, s_resample,   "resample");
-    audio_pipeline_register(s_pipeline, s_raw_read,   "raw");
+    esp_err_t ret;
+    ret = audio_pipeline_register(s_pipeline, s_i2s_reader, "i2s");
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "pipeline register i2s failed: %s", esp_err_to_name(ret));
+        goto cleanup;
+    }
+    ret = audio_pipeline_register(s_pipeline, s_resample, "resample");
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "pipeline register resample failed: %s", esp_err_to_name(ret));
+        goto cleanup;
+    }
+    ret = audio_pipeline_register(s_pipeline, s_raw_read, "raw");
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "pipeline register raw failed: %s", esp_err_to_name(ret));
+        goto cleanup;
+    }
 
     const char *links[] = {"i2s", "resample", "raw"};
-    audio_pipeline_link(s_pipeline, links, 3);
+    ret = audio_pipeline_link(s_pipeline, links, 3);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "pipeline link failed: %s", esp_err_to_name(ret));
+        goto cleanup;
+    }
 
     ESP_LOGI(TAG, "audio capture pipeline ready (48kHz -> 16kHz mono)");
     return ESP_OK;
+
+cleanup:
+    audio_element_deinit(s_i2s_reader); s_i2s_reader = NULL;
+    audio_element_deinit(s_resample);   s_resample   = NULL;
+    audio_element_deinit(s_raw_read);   s_raw_read   = NULL;
+    audio_pipeline_deinit(s_pipeline);  s_pipeline   = NULL;
+    return ret;
 }
 
 esp_err_t audio_pipeline_mgr_start(void) {
     if (!s_pipeline) return ESP_ERR_INVALID_STATE;
-    return audio_pipeline_run(s_pipeline);
+    if (s_running) return ESP_OK;
+    esp_err_t ret = audio_pipeline_run(s_pipeline);
+    if (ret == ESP_OK) s_running = true;
+    return ret;
 }
 
 esp_err_t audio_pipeline_mgr_stop(void) {
-    if (!s_pipeline) return ESP_ERR_INVALID_STATE;
+    if (!s_pipeline || !s_running) return ESP_ERR_INVALID_STATE;
     audio_pipeline_stop(s_pipeline);
     audio_pipeline_wait_for_stop(s_pipeline);
+    s_running = false;
     return ESP_OK;
 }
 
